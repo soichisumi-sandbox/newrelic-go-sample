@@ -1,0 +1,16 @@
+version: '3'
+services:
+  app:
+    build: .
+    image: "soichisumi0/http-sample-app"
+    ports:
+      - "8888:8080"
+  db:
+    image: mariadb:10.5.4
+    ports:
+      - "33306:3306"
+    environment:
+      - MYSQL_ALLOW_EMPTY_PASSWORD=yes
+#      - MYSQL_INITDB_SKIP_TZINFO=1
+    volumes:
+      - ./docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
