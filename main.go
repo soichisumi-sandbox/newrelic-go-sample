@@ -2,14 +2,19 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
+	_ "github.com/newrelic/go-agent/v3/integrations/nrmysql"
+	"github.com/newrelic/go-agent/v3/newrelic"
+	"github.com/newrelic/newrelic-opencensus-exporter-go/nrcensus"
 	"github.com/soichisumi/go-util/logger"
+	"go.opencensus.io/trace"
 	"go.uber.org/zap"
 	"io"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"os"
 	"regexp"
@@ -20,12 +25,14 @@ const (
 	//defaultDBUser = "root"
 	//defaultDBPassword = ""
 	//defaultDBHost = ""
-
 	dataSourceName = "root:@tcp(db:3306)/test"
+	driverName     = "nrmysql"
 )
+
 var (
 	db            *sql.DB
 	captureUserID *regexp.Regexp
+	app           *newrelic.Application
 
 	//stmtCreateUser *sql.Stmt
 	//stmtGetUser *sql.Stmt
@@ -39,9 +46,9 @@ func init() {
 }
 
 type User struct {
-	ID string `json:"id"`
+	ID    string `json:"id"`
 	Email string `json:"email"`
-	Name string `json:"name"`
+	Name  string `json:"name"`
 }
 
 func logInterceptor(f func(w http.ResponseWriter, r *http.Request)) func(w http.ResponseWriter, r *http.Request) {
@@ -78,8 +85,8 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func createUser(u User) error {
-	res, err := db.Exec("INSERT INTO users(id, email, name) VALUES(?, ?, ?)", u.ID, u.Email, u.Name)
+func createUser(ctx context.Context, u User) error {
+	res, err := db.ExecContext(ctx, "INSERT INTO users(id, email, name) VALUES(?, ?, ?)", u.ID, u.Email, u.Name)
 	if err != nil {
 		return err
 	}
@@ -87,33 +94,33 @@ func createUser(u User) error {
 	return nil
 }
 
-func listUsers() ([]User, error) {
-	rows, err := db.Query("SELECT * FROM users")
+func listUsers(ctx context.Context) ([]User, error) {
+	rows, err := db.QueryContext(ctx, "SELECT * FROM users")
 	if err != nil {
 		return nil, err
 	}
 	var res []User
 	for rows.Next() {
 		var (
-			id   string
+			id    string
 			email string
-			name string
+			name  string
 		)
 		if err := rows.Scan(&id, &email, &name); err != nil {
 			return nil, err
 		}
 		res = append(res, User{
-			ID: id,
+			ID:    id,
 			Email: email,
-			Name: name,
+			Name:  name,
 		})
 	}
 	return res, nil
 }
 
-func getUser(id string) (User, error) {
+func getUser(ctx context.Context, id string) (User, error) {
 	u := User{}
-	if err := db.QueryRow("SELECT * FROM users WHERE id = ?", id).Scan(&u.ID, &u.Email, &u.Name); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT * FROM users WHERE id = ?", id).Scan(&u.ID, &u.Email, &u.Name); err != nil {
 		return User{}, err
 	}
 	return u, nil
@@ -127,13 +134,9 @@ func getUserID(path string) string {
 	return s[1]
 }
 
-// target: address of variable
-//func readJson(r io.Reader, target interface{}) error {
-//	return json.NewDecoder(r).Decode(target)
-//}
-
-func handleCreateUser(w http.ResponseWriter, r *http.Request) {
+func handleCreateUser(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	logger.Info("create user")
+
 	var u User
 	if err := json.NewDecoder(r.Body).Decode(&u); err != nil && err != io.EOF {
 		w.WriteHeader(http.StatusBadRequest)
@@ -150,7 +153,7 @@ func handleCreateUser(w http.ResponseWriter, r *http.Request) {
 
 	u.ID = uuid.New().String()
 
-	if err := createUser(u); err != nil {
+	if err := createUser(ctx, u); err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		logger.Error("", zap.Error(err))
 		return
@@ -158,9 +161,10 @@ func handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func handleListUsers(w http.ResponseWriter, r *http.Request) {
+func handleListUsers(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	logger.Info("list users")
-	users, err := listUsers()
+
+	users, err := listUsers(ctx)
 	if err != nil {
 		logger.Error("", zap.Error(err))
 		w.WriteHeader(http.StatusInternalServerError)
@@ -181,9 +185,9 @@ func handleListUsers(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
-func handleGetUser(w http.ResponseWriter, r *http.Request) {
+func handleGetUser(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	logger.Info("get user")
-	user, err := getUser(getUserID(r.URL.Path))
+	user, err := getUser(ctx, getUserID(r.URL.Path))
 	if err != nil {
 		logger.Error("", zap.Error(err))
 		w.WriteHeader(http.StatusInternalServerError)
@@ -206,7 +210,10 @@ func handleGetUser(w http.ResponseWriter, r *http.Request) {
 
 func usersHandler(w http.ResponseWriter, r *http.Request) {
 	logger.Info("user handler")
-	_db, err := sql.Open("mysql", dataSourceName)
+
+	ctx := r.Context()
+
+	_db, err := sql.Open(driverName, dataSourceName)
 	if err != nil {
 		logger.Fatal("", zap.Error(err))
 	}
@@ -217,12 +224,12 @@ func usersHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		if id == "" {
-			handleListUsers(w, r)
+			handleListUsers(ctx, w, r)
 		} else {
-			handleGetUser(w, r)
+			handleGetUser(ctx, w, r)
 		}
 	case http.MethodPost:
-		handleCreateUser(w, r)
+		handleCreateUser(ctx, w, r)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -235,14 +242,35 @@ func main() {
 		port = os.Getenv("PORT")
 	}
 
-	_db, err := sql.Open("mysql", dataSourceName)
+	_db, err := sql.Open(driverName, dataSourceName)
 	if err != nil {
 		logger.Fatal("", zap.Error(err))
 	}
 	db = _db
 
-	http.HandleFunc("/", logInterceptor(rootHandler))
-	http.HandleFunc("/users/", logInterceptor(usersHandler))
+	//newrelic apm
+	_app, err := newrelic.NewApplication(
+		newrelic.ConfigAppName("newrelic-go-sample"),
+		newrelic.ConfigLicense(os.Getenv("NEWRELIC_LICENSE_KEY")),
+		newrelic.ConfigDistributedTracerEnabled(true),
+		//newrelic.ConfigDebugLogger(os.Stdout),
+	)
+	if err != nil {
+		logger.Fatal("", zap.Error(err))
+	}
+	app = _app
+
+	exporter, err := nrcensus.NewExporter(
+		"NewRelicGoSample",
+		os.Getenv("NEWRELIC_API_KEY"),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	trace.RegisterExporter(exporter)
+
+	http.HandleFunc(newrelic.WrapHandleFunc(app, "/", logInterceptor(rootHandler)))
+	http.HandleFunc(newrelic.WrapHandleFunc(app, "/users/", logInterceptor(usersHandler)))
 
 	logger.Info("http-mock-server is listening.", zap.String("port", port))
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
